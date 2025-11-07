@@ -1,0 +1,267 @@
+#include <Wire.h>
+#include <SPI.h>
+#include <BLEPeripheral.h>
+#include "AD5933.h"
+#include "NAND_Micron.h"
+#include "nrf_calendar.h"
+#include <math.h>
+
+/* -------- PIN MAP -------- */
+#define SOFTSPI_SCK_PIN   17
+#define SOFTSPI_MOSI_PIN  11
+#define SOFTSPI_MISO_PIN  12
+#define SOFTSPI_CS_PIN    16
+#define SOFTSPI_DELAY_US  5
+
+/* -------- AD5933 configuration -------- */
+#define START_FREQ    1000
+#define FREQ_INCR     1
+#define NUM_INCR      1
+#define REF_RESIST    20000
+#define SAMPLE_DELAY  50
+#define BURST_PERIOD  30000UL    // 30 s for quick testing
+
+/* -------- Data record -------- */
+struct __attribute__((packed)) ImpRec {
+  char  timestamp[24];    // "YYYY-MM-DD HH:MM:SS"
+  float impedance;
+  uint8_t reserved[8];
+};
+
+// --- RAM buffer ---
+#define RECORD_BUFFER_SIZE 32
+ImpRec recordBuffer[RECORD_BUFFER_SIZE];
+uint8_t recordCount = 0;
+
+/* -------- Globals -------- */
+BLEFixedLengthCharacteristic timeSetChar("2A2B", BLEWrite, 19);
+bool timeIsSet = false;
+AD5933 ad5933;
+double gain[NUM_INCR + 1];
+int phase[NUM_INCR + 1];
+uint32_t curBlock = 0;
+uint16_t curPage  = 0;
+uint16_t curCol   = 0;
+uint32_t lastSentBlock = 0;
+uint16_t lastSentPage  = 0;
+unsigned long lastBurst = 0;
+
+/* -------- BLE -------- */
+const char * localName = "Impedance Patch";
+BLEPeripheral blePeriph;
+BLEService impedanceService("180C");
+BLECharacteristic dataChar("2A56", BLERead | BLENotify, 20);
+char bleBuffer[20];
+
+/* -------- SoftSPI helpers -------- */
+void csLow()  { digitalWrite(SOFTSPI_CS_PIN, LOW); }
+void csHigh() { digitalWrite(SOFTSPI_CS_PIN, HIGH); }
+
+uint8_t spiXferByte(uint8_t v) {
+  uint8_t r = 0;
+  for (uint8_t i = 0; i < 8; i++) {
+    digitalWrite(SOFTSPI_MOSI_PIN, (v & 0x80) ? HIGH : LOW);
+    delayMicroseconds(SOFTSPI_DELAY_US);
+    digitalWrite(SOFTSPI_SCK_PIN, HIGH);
+    delayMicroseconds(SOFTSPI_DELAY_US);
+    r <<= 1;
+    if (digitalRead(SOFTSPI_MISO_PIN)) r |= 1;
+    digitalWrite(SOFTSPI_SCK_PIN, LOW);
+    delayMicroseconds(SOFTSPI_DELAY_US);
+    v <<= 1;
+  }
+  return r;
+}
+
+/* -------- NAND read helper -------- */
+bool readPageRaw(uint32_t block, uint16_t page, uint8_t *buf) {
+  uint32_t pageAddr = (block * PAGES_PER_BLOCK) + page;
+  csLow();
+  spiXferByte(0x13);
+  spiXferByte((pageAddr >> 16) & 0xFF);
+  spiXferByte((pageAddr >> 8) & 0xFF);
+  spiXferByte(pageAddr & 0xFF);
+  csHigh();
+  delayMicroseconds(50);
+  csLow();
+  spiXferByte(0x03);
+  spiXferByte(0x00); spiXferByte(0x00); spiXferByte(0x00);
+  for (uint16_t i = 0; i < BYTES_PER_PAGE; i++) buf[i] = spiXferByte(0x00);
+  csHigh();
+  return true;
+}
+
+/* -------- BLE callback -------- */
+void onTimeWrite(BLECentral& central, BLECharacteristic& characteristic) {
+  String t = String((const char*)characteristic.value());
+  int y,M,d,h,m,s;
+  if (sscanf(t.c_str(), "%d-%d-%d %d:%d:%d", &y,&M,&d,&h,&m,&s) == 6) {
+    nrf_cal_set_time(y, M, d, h, m, s);
+    Serial.print(F("# RTC updated to: "));
+    Serial.println(nrf_cal_get_time_string(false));
+
+    Serial.println(F("# Starting AD5933 calibration..."));
+    if (ad5933.calibrate(gain, phase, REF_RESIST, NUM_INCR + 1))
+      Serial.println(F("# Sensor recalibrated successfully."));
+    else
+      Serial.println(F("# Sensor recalibration failed!"));
+
+    timeIsSet = true;
+    lastBurst = millis();
+    Serial.println(F("# Logging started.\n"));
+  } else {
+    Serial.println(F("# Invalid time format! Use YYYY-MM-DD HH:MM:SS"));
+  }
+}
+
+/* -------- Setup -------- */
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000);
+
+  pinMode(SOFTSPI_SCK_PIN, OUTPUT);
+  pinMode(SOFTSPI_MOSI_PIN, OUTPUT);
+  pinMode(SOFTSPI_MISO_PIN, INPUT);
+  pinMode(SOFTSPI_CS_PIN, OUTPUT);
+  digitalWrite(SOFTSPI_CS_PIN, HIGH);
+
+  Serial.println(F("\n# Initializing NAND + AD5933..."));
+  nandReset();
+  nandWriteEnable();
+  nandSetFeature(REG_BLOCK_LOCK, 0x00);
+  uint8_t cfg = nandGetFeature(REG_CONFIGURATION);
+  nandWriteEnable();
+  nandSetFeature(REG_CONFIGURATION, cfg | CFG_ECC_EN);
+
+  // ⚠️ Comment next line if you want to preserve data between runs
+  nandBlockErase(0);
+
+  startNewPage();
+  Serial.println(F("# NAND ready."));
+
+  if (!(ad5933.reset() &&
+        ad5933.setInternalClock(true) &&
+        ad5933.setStartFrequency(START_FREQ) &&
+        ad5933.setIncrementFrequency(FREQ_INCR) &&
+        ad5933.setNumberIncrements(NUM_INCR) &&
+        ad5933.setPGAGain(PGA_GAIN_X1))) {
+    Serial.println(F("# AD5933 init failed!"));
+    while (1);
+  }
+  ad5933.setSettlingCycles(1);
+  if (ad5933.calibrate(gain, phase, REF_RESIST, NUM_INCR + 1))
+    Serial.println(F("# Sensor calibrated."));
+  else
+    Serial.println(F("# Sensor calibration failed!"));
+
+  // BLE setup
+  blePeriph.setDeviceName(localName);
+  blePeriph.setLocalName(localName);
+  blePeriph.setAdvertisedServiceUuid(impedanceService.uuid());
+  blePeriph.addAttribute(impedanceService);
+  blePeriph.addAttribute(dataChar);
+  blePeriph.addAttribute(timeSetChar);
+  timeSetChar.setEventHandler(BLEWritten, onTimeWrite);
+  blePeriph.begin();
+  Serial.println(F("# BLE advertising started."));
+
+  // RTC
+  nrf_cal_init();
+  Serial.println(F("# RTC ready — waiting for phone time sync.\n"));
+  lastBurst = millis();
+}
+
+/* -------- Main Loop -------- */
+void loop() {
+  blePeriph.poll();
+
+  if (!timeIsSet) {
+    delay(100);
+    return;
+  }
+
+  int real[NUM_INCR + 1];
+  int imag[NUM_INCR + 1];
+  double impedance = 0.0;
+
+  // --- Take impedance sample ---
+  if (ad5933.frequencySweep(real, imag, NUM_INCR + 1)) {
+    double mag = sqrt((double)real[0]*real[0] + (double)imag[0]*imag[0]);
+    impedance = 1.0 / (mag * gain[0]);
+
+    if (impedance > 0 && impedance < 1e6) {
+      ImpRec rec;
+      strncpy(rec.timestamp, nrf_cal_get_time_string(false), sizeof(rec.timestamp)-1);
+      rec.timestamp[sizeof(rec.timestamp)-1] = '\0';
+      rec.impedance = impedance;
+      memset(rec.reserved, 0xFF, sizeof(rec.reserved));
+
+      recordBuffer[recordCount++] = rec;
+
+      // --- If buffer full, flush to NAND ---
+      if (recordCount >= RECORD_BUFFER_SIZE) {
+        for (uint8_t i = 0; i < recordCount; i++) {
+          if (curCol + sizeof(ImpRec) > BYTES_PER_PAGE) {
+            finalizePageProgram();
+            startNewPage();
+            curCol = 0;
+          }
+          pageAppendChunk((uint8_t*)&recordBuffer[i], sizeof(ImpRec));
+          curCol += sizeof(ImpRec);
+        }
+        finalizePageProgram();
+        recordCount = 0;
+      }
+    }
+  }
+
+  ad5933.setControlMode(0xA0);
+  delay(SAMPLE_DELAY);
+
+  // --- Every BURST_PERIOD: send stored data ---
+  if (millis() - lastBurst >= BURST_PERIOD) {
+    lastBurst = millis();
+    finalizePageProgram();
+
+    Serial.println(F("\n# --- 2-Minute BLE Burst ---"));
+    uint8_t buf[BYTES_PER_PAGE];
+    uint32_t b = lastSentBlock;
+    uint16_t p = lastSentPage;
+    bool printed = false;
+
+    while (true) {
+      readPageRaw(b, p, buf);
+      for (uint16_t offset = 0; offset < BYTES_PER_PAGE; offset += sizeof(ImpRec)) {
+        ImpRec *rec = (ImpRec*)(buf + offset);
+        if (rec->timestamp[0] == 0xFF || rec->impedance <= 0 || rec->impedance > 1e6)
+          break;
+
+        snprintf(bleBuffer, sizeof(bleBuffer), "%s,%.3f", rec->timestamp, rec->impedance);
+        dataChar.setValue((const unsigned char*)bleBuffer, strlen(bleBuffer));
+        blePeriph.poll();
+        Serial.println(bleBuffer);
+        printed = true;
+        delay(5);
+      }
+      p++;
+      if (p >= PAGES_PER_BLOCK) { p = 0; b++; }
+      if (b > curBlock || (b == curBlock && p >= curPage)) break;
+    }
+
+    if (!printed)
+      Serial.println(F("(no valid records found)"));
+
+    lastSentBlock = curBlock;
+    lastSentPage  = curPage;
+    curPage++;
+    if (curPage >= PAGES_PER_BLOCK) {
+      curPage = 0;
+      curBlock++;
+      if (curBlock >= BLOCKS_TOTAL) curBlock = 0;
+      nandBlockErase(curBlock);
+    }
+    startNewPage();
+    Serial.println(F("# --- End of BLE Burst ---\n"));
+  }
+}
