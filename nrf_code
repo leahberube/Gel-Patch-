@@ -1,0 +1,54 @@
+#include <BLEPeripheral.h>
+
+// --------------- BLE Setup ---------------
+BLEPeripheral blePeripheral;
+blePeripheral.setScanResponse(true);
+BLEService diagService("180C");
+BLECharacteristic diagChar("2A56", BLERead | BLENotify, 20);
+
+void setup() {
+
+  // --------- GPIO Test (P0.06) ---------
+  pinMode(8, OUTPUT);  // toggles this pin every 500 ms
+
+  // --------- UART Test ---------
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("UART OK: Starting diagnostics...");
+
+  // --------- BLE Setup ---------
+  blePeripheral.setLocalName("DiagTest");
+  blePeripheral.setDeviceName("DiagTest");
+  blePeripheral.setAdvertisedServiceUuid(diagService.uuid());
+
+  blePeripheral.addAttribute(diagService);
+  blePeripheral.addAttribute(diagChar);
+
+  blePeripheral.begin();
+
+  Serial.println("BLE OK: Advertising...");
+}
+
+unsigned long lastToggle = 0;
+unsigned long lastBLE = 0;
+
+void loop() {
+  blePeripheral.poll();
+
+  unsigned long now = millis();
+
+  // --------- GPIO Toggle Test ---------
+  if (now - lastToggle >= 500) {
+    static bool state = false;
+    digitalWrite(8, state ? HIGH : LOW);
+    state = !state;
+    lastToggle = now;
+  }
+
+  // --------- UART Print Test ---------
+  if (now - lastBLE >= 1000) {
+    Serial.println("Tick (UART)");
+    diagChar.setValue("Tick (BLE)");
+    lastBLE = now;
+  }
+}
