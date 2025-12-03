@@ -2,7 +2,6 @@
 
 // --------------- BLE Setup ---------------
 BLEPeripheral blePeripheral;
-blePeripheral.setScanResponse(true);
 BLEService diagService("180C");
 BLECharacteristic diagChar("2A56", BLERead | BLENotify, 20);
 
